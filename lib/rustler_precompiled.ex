@@ -181,29 +181,46 @@ defmodule RustlerPrecompiled do
           )
         end
 
+      {:ok, metadata} = RustlerPrecompiled.build_config(__MODULE__, opts) |> RustlerPrecompiled.build_metadata()
       case RustlerPrecompiled.__using__(__MODULE__, opts) do
         {:force_build, only_rustler_opts} ->
           unquote(force)
 
         {:ok, config} ->
           @on_load :load_rustler_precompiled
+          @rustler_precompiled_opts opts
+          @rustler_precompiled_metadata metadata
           @rustler_precompiled_load_from config.load_from
           @rustler_precompiled_load_data config.load_data
-          @rustler_precompiled_opts opts
 
           @doc false
           def load_rustler_precompiled do
-            # Remove any old modules that may be loaded so we don't get
-            # {:error, {:upgrade, 'Upgrade not supported by this NIF library.'}}
             :code.purge(__MODULE__)
-            {otp_app, path} = @rustler_precompiled_load_from
+
+            config = rustler_precompiled_config()
+
+            {:ok, metadata} = RustlerPrecompiled.build_metadata(config)
+
+            config = @rustler_precompiled_metadata
+            |> case do
+              ^metadata -> %{
+                load_from: @rustler_precompiled_load_from,
+                load_data: @rustler_precompiled_load_data
+              }
+
+              _ ->
+                {:ok, config} = RustlerPrecompiled.download_or_reuse_nif_file(config, metadata, skip_checksum: true)
+                config
+            end
+
+            {otp_app, path} = config.load_from
 
             load_path =
               otp_app
               |> Application.app_dir(path)
               |> to_charlist()
 
-            :erlang.load_nif(load_path, @rustler_precompiled_load_data)
+            :erlang.load_nif(load_path, config.load_data)
           end
 
           def rustler_precompiled_config() do
