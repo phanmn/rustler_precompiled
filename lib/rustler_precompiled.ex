@@ -189,9 +189,6 @@ defmodule RustlerPrecompiled do
         {:ok, config} ->
           @on_load :load_rustler_precompiled
           @rustler_precompiled_opts opts
-          @rustler_precompiled_metadata metadata
-          @rustler_precompiled_load_from config.load_from
-          @rustler_precompiled_load_data config.load_data
 
           @doc false
           def load_rustler_precompiled do
@@ -200,18 +197,10 @@ defmodule RustlerPrecompiled do
             config = rustler_precompiled_config()
 
             {:ok, metadata} = RustlerPrecompiled.build_metadata(config)
-
-            config = @rustler_precompiled_metadata
-            |> case do
-              ^metadata -> %{
-                load_from: @rustler_precompiled_load_from,
-                load_data: @rustler_precompiled_load_data
-              }
-
-              _ ->
-                {:ok, config} = RustlerPrecompiled.download_or_reuse_nif_file(config, metadata, skip_checksum: true)
-                config
-            end
+            config = %{
+              load_from: {config.otp_app, Path.join("priv/native", Map.fetch!(metadata, :lib_name))},
+              load_data: config.load_data
+            }
 
             {otp_app, path} = config.load_from
 
