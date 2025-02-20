@@ -189,6 +189,7 @@ defmodule RustlerPrecompiled do
           @on_load :load_rustler_precompiled
           @rustler_precompiled_load_from config.load_from
           @rustler_precompiled_load_data config.load_data
+          @rustler_precompiled_opts opts
 
           @doc false
           def load_rustler_precompiled do
@@ -205,6 +206,10 @@ defmodule RustlerPrecompiled do
             :erlang.load_nif(load_path, @rustler_precompiled_load_data)
           end
 
+          def rustler_precompiled_config() do
+            RustlerPrecompiled.build_config(__MODULE__, @rustler_precompiled_opts)
+          end
+
         {:error, precomp_error} ->
           raise precomp_error
       end
@@ -215,9 +220,8 @@ defmodule RustlerPrecompiled do
   @doc false
   def __using__(module, opts) do
     config =
-      opts
-      |> Keyword.put_new(:module, module)
-      |> RustlerPrecompiled.Config.new()
+      module
+      |> build_config(opts)
 
     case build_metadata(config) do
       {:ok, metadata} ->
@@ -477,7 +481,7 @@ defmodule RustlerPrecompiled do
     end
   end
 
-  defp target_config(available_nif_versions \\ Config.available_nif_versions()) do
+  defp target_config(available_nif_versions \\ Config.available_nif_versions(), get_env \\ &System.get_env/1) do
     current_nif_version = :erlang.system_info(:nif_version) |> List.to_string()
 
     nif_version =
@@ -494,7 +498,7 @@ defmodule RustlerPrecompiled do
 
     %{
       os_type: :os.type(),
-      target_system: maybe_override_with_env_vars(current_system_arch),
+      target_system: maybe_override_with_env_vars(current_system_arch, get_env),
       word_size: :erlang.system_info(:wordsize),
       nif_version: nif_version
     }
@@ -627,7 +631,7 @@ defmodule RustlerPrecompiled do
   # In case target cannot be resolved and "force build" is enabled,
   # returns only the basic metadata.
   @doc false
-  def build_metadata(%Config{} = config) do
+  def build_metadata(%Config{} = config, get_env \\ &System.get_env/1) do
     basic_metadata = %{
       base_url: config.base_url,
       crate: config.crate,
@@ -638,7 +642,7 @@ defmodule RustlerPrecompiled do
       version: config.version
     }
 
-    case target(target_config(config.nif_versions), config.targets, config.nif_versions) do
+    case target(target_config(config.nif_versions, get_env), config.targets, config.nif_versions) do
       {:ok, target} ->
         basename = config.crate || config.otp_app
 
@@ -713,7 +717,7 @@ defmodule RustlerPrecompiled do
   # has details about what is the current target and where
   # to save the downloaded tar.gz.
   @doc false
-  def download_or_reuse_nif_file(%Config{} = config, metadata) when is_map(metadata) do
+  def download_or_reuse_nif_file(%Config{} = config, metadata, opts \\ []) when is_map(metadata) do
     name = config.otp_app
 
     native_dir = Application.app_dir(name, @native_dir)
@@ -727,6 +731,7 @@ defmodule RustlerPrecompiled do
 
     base_url = config.base_url
     nif_module = config.module
+    skip_checksum = Keyword.get(opts, :skip_checksum, false)
 
     result = %{
       load?: true,
@@ -738,8 +743,12 @@ defmodule RustlerPrecompiled do
       # Remove existing NIF file so we don't have processes using it.
       # See: https://github.com/rusterlium/rustler/blob/46494d261cbedd3c798f584459e42ab7ee6ea1f4/rustler_mix/lib/rustler/compiler.ex#L134
       File.rm(lib_file)
+      checksum = cond do
+        skip_checksum -> :ok
+        true -> check_file_integrity(cached_tar_gz, nif_module)
+      end
 
-      with :ok <- check_file_integrity(cached_tar_gz, nif_module),
+      with :ok <- checksum,
            :ok <- :erl_tar.extract(cached_tar_gz, [:compressed, cwd: Path.dirname(lib_file)]) do
         Logger.debug("Copying NIF from cache and extracting to #{lib_file}")
         {:ok, result}
@@ -747,13 +756,17 @@ defmodule RustlerPrecompiled do
     else
       dirname = Path.dirname(lib_file)
       tar_gz_url = tar_gz_file_url(base_url, lib_name_with_ext(cached_tar_gz, lib_name))
+      checksum = cond do
+        skip_checksum -> :ok
+        true -> check_file_integrity(cached_tar_gz, nif_module)
+      end
 
       with :ok <- File.mkdir_p(cache_dir),
            :ok <- File.mkdir_p(dirname),
            {:ok, tar_gz} <-
              with_retry(fn -> download_nif_artifact(tar_gz_url) end, config.max_retries),
            :ok <- File.write(cached_tar_gz, tar_gz),
-           :ok <- check_file_integrity(cached_tar_gz, nif_module),
+           :ok <- checksum,
            :ok <-
              :erl_tar.extract({:binary, tar_gz}, [:compressed, cwd: Path.dirname(lib_file)]) do
         Logger.debug("NIF cached at #{cached_tar_gz} and extracted to #{lib_file}")
@@ -1062,7 +1075,7 @@ defmodule RustlerPrecompiled do
     end
   end
 
-  defp metadata_file(nif_module) when is_atom(nif_module) do
+  def metadata_file(nif_module) when is_atom(nif_module) do
     rustler_precompiled_cache = cache_dir("metadata")
     Path.join(rustler_precompiled_cache, "metadata-#{nif_module}.exs")
   end
@@ -1103,5 +1116,35 @@ defmodule RustlerPrecompiled do
   defp checksum_file(nif_module) do
     # Saves the file in the project root.
     Path.join(File.cwd!(), "checksum-#{nif_module}.exs")
+  end
+
+  def build_config(module, opts) do
+    opts
+    |> Keyword.put_new(:module, module)
+    |> RustlerPrecompiled.Config.new()
+  end
+
+  def download_nif_artifact(module, target) do
+    get_env = fn
+      "TARGET_ARCH" ->
+        target.arch
+
+      "TARGET_VENDOR" ->
+        target.vendor
+
+      "TARGET_OS" ->
+        target.os
+
+      "TARGET_ABI" ->
+        target.abi
+
+      env -> System.get_env(env)
+    end
+
+    config = apply(module, :rustler_precompiled_config, [])
+
+    with {:ok, metadata} <- build_metadata(config, get_env) do
+      download_or_reuse_nif_file(config, metadata, skip_checksum: true)
+    end
   end
 end
